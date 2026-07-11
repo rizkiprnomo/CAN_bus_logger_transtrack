@@ -1,0 +1,21 @@
+menu "TWAI CAN Configuration"
+
+    choice TWAI_BITRATE_CHOICE
+        prompt "TWAI CAN Bitrate"
+        default TWAI_BITRATE_250K
+        help
+            Pilih kecepatan baud rate untuk periferal TWAI CAN Bus.
+
+        config TWAI_BITRATE_250K
+            bool "250 kbps"
+            
+        config TWAI_BITRATE_500K
+            bool "500 kbps"
+    endchoice
+
+    config TWAI_BITRATE_VALUE
+        int
+        default 250000 if TWAI_BITRATE_250K
+        default 500000 if TWAI_BITRATE_500K
+
+endmenu
