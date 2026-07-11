@@ -14,30 +14,28 @@
 #include "sdkconfig.h"
 
 
-#define SDMMC_CLK_PIN   GPIO_NUM_12
-#define SDMMC_CMD_PIN   GPIO_NUM_11
-#define SDMMC_D0_PIN    GPIO_NUM_13
-#define SDMMC_D1_PIN    GPIO_NUM_14
-#define SDMMC_D2_PIN    GPIO_NUM_9
-#define SDMMC_D3_PIN    GPIO_NUM_10
+#define SDMMC_CLK_PIN   GPIO_NUM_36
+#define SDMMC_CMD_PIN   GPIO_NUM_35
+#define SDMMC_D0_PIN    GPIO_NUM_37
+#define SDMMC_D1_PIN    GPIO_NUM_38
+#define SDMMC_D2_PIN    GPIO_NUM_39
+#define SDMMC_D3_PIN    GPIO_NUM_40
 
 #define TWAI_TX_PIN     GPIO_NUM_4
 #define TWAI_RX_PIN     GPIO_NUM_5
 
-#define USER_BUTTON_PIN GPIO_NUM_1
-#define STATUS_LED_PIN  GPIO_NUM_6
+#define USER_BUTTON_PIN GPIO_NUM_7
+#define STATUS_LED_PIN  GPIO_NUM_8
 
-#define UART_TX         GPIO_NUM_17
-#define UART_RX         GPIO_NUM_18
-
-#define UART_NUM        UART_NUM_1
+#define UART_NUM        UART_NUM_0
 #define UART_BUF_SIZE   1024
+#define MOUNT_POINT       "/sdcard"
 
 
 sdmmc_card_t *sd_card = NULL;
 const char mount_point[] = "/sdcard";
 
-static const char *TAG = "TWAI_CAN";
+static const char *TAG = "CAN_LOGGER";
 twai_node_handle_t twai_node = NULL;
 
 
@@ -62,7 +60,6 @@ void init_twai(void) {
         .flags.enable_listen_only = true 
     };
 
-    
     esp_err_t ret = twai_new_node_onchip(&node_config, &twai_node);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create TWAI node: %s", esp_err_to_name(ret));
@@ -100,9 +97,8 @@ void init_twai(void) {
     }
 }
 
-static void init_sdmmc(void)
-{
-    esp_err_t ret;
+void init_sdmmc(void) {
+    ESP_LOGI(TAG, "Initializing SD Card via SDMMC 4-bit mode...");
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
@@ -111,24 +107,30 @@ static void init_sdmmc(void)
     };
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-
-    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.clk = SDMMC_CLK_PIN;
-    slot_config.cmd = SDMMC_CMD_PIN;
-    slot_config.d0  = SDMMC_D0_PIN;
-    slot_config.d1  = SDMMC_D1_PIN;
-    slot_config.d2  = SDMMC_D2_PIN;
-    slot_config.d3  = SDMMC_D3_PIN;
-    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-    ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &sd_card);
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    //host.max_freq_khz = 4000; // Un-comment to customize frequency
     
-    if (ret != ESP_OK) {
-        printf("Failed to initialize SDMMC: %s\n", esp_err_to_name(ret));
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = 4;
+    
+    slot_config.clk = (gpio_num_t)SDMMC_CLK_PIN;
+    slot_config.cmd = (gpio_num_t)SDMMC_CMD_PIN;
+    slot_config.d0  = (gpio_num_t)SDMMC_D0_PIN;
+    slot_config.d1  = (gpio_num_t)SDMMC_D1_PIN;
+    slot_config.d2  = (gpio_num_t)SDMMC_D2_PIN;
+    slot_config.d3  = (gpio_num_t)SDMMC_D3_PIN;
+    
+    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP; 
+
+    esp_err_t ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &sd_card);
+    
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "SD Card initialization: SUCCESSFUL.");
+        sdmmc_card_print_info(stdout, sd_card); 
+    } else {
         sd_card = NULL; 
-        return;
+        ESP_LOGE(TAG, "SD Card initialization: FAILED (%s). The device continues to operate without logging functionality.", esp_err_to_name(ret));
     }
-    printf("SDMMC successfully mounted globally.\n");
 }
 
 
@@ -202,16 +204,6 @@ void init_ui_and_uart(void) {
             uart_success = false;
         }
     }
-
-    if (uart_success) {
-        ret = uart_set_pin(UART_NUM, UART_TX, UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "UART pin setting FAILED: %s", esp_err_to_name(ret));
-            uart_success = false;
-        }
-    }
-
-    // Cetak Status Akhir UART
     if (uart_success) {
         ESP_LOGI(TAG, "UART Shell Initialization (UART %d): SUCCESS", UART_NUM);
     } else {
