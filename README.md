@@ -37,38 +37,48 @@ To establish a TWAI network, the ESP32 must be connected to a CAN transceiver (e
 
 ## 2. Bitrate Calculation
 
-TWAI timing parameters are derived from the ESP32 source clock ($f_{CLK}$, typically $80 \text{ MHz}$). The total bit time is divided into Time Quanta ($T_q$) and consists of three segments: **Sync_Seg**, **Bit_Seg1**, and **Bit_Seg2**.
+TWAI timing parameters are derived from the ESP32 source clock ($f_{\text{CLK}}$, typically $80 \text{ MHz}$). The total bit time is divided into Time Quanta ($T_q$) and consists of three segments: **Sync_Seg**, **Bit_Seg1**, and **Bit_Seg2**.
 
 ### Mathematical Formulas
 
 1. **Time Quantum ($T_q$)**
-   $$T_q = \frac{\text{BRP}}{f_{CLK}}$$
+
+   $$T_q = \frac{\text{BRP}}{f_{\text{CLK}}}$$
+
    *Where $\text{BRP}$ is the Bit Rate Prescaler (integer).*
 
 2. **Total Number of Quanta per Bit ($N_{Tq}$)**
-   $$N_{Tq} = \text{Sync\_Seg} + \text{Bit\_Seg1} + \text{Bit\_Seg2}$$
-   *(Note: $\text{Sync\_Seg}$ is always fixed at $1 \cdot T_q$).*
+
+   $$N_{Tq} = T_{\text{sync}} + T_{\text{seg1}} + T_{\text{seg2}}$$
+
+   *(Note: $T_{\text{sync}}$ is always fixed at $1 \cdot T_q$).*
 
 3. **Final Bitrate Formula**
-   $$\text{Bitrate} = \frac{1}{N_{Tq} \times T_q} = \frac{f_{CLK}}{\text{BRP} \times N_{Tq}}$$
+
+   $$\text{Bitrate} = \frac{1}{N_{Tq} \times T_q} = \frac{f_{\text{CLK}}}{\text{BRP} \times N_{Tq}}$$
 
 ---
 
 ### Example Configuration: 250 kbps
-Given $f_{CLK} = 80 \text{ MHz}$:
+Given $f_{\text{CLK}} = 80 \text{ MHz}$:
 * **Prescaler Selection:** Set $\text{BRP} = 16 \implies T_q = \frac{16}{80,000,000} = 200 \text{ ns}$
 * **Quanta Allocation:** Set $N_{Tq} = 20$ 
-  $$\text{Sync\_Seg} = 1, \quad \text{Bit\_Seg1} = 15, \quad \text{Bit\_Seg2} = 4$$
+
+  $$T_{\text{sync}} = 1, \quad T_{\text{seg1}} = 15, \quad T_{\text{seg2}} = 4$$
+
 * **Calculation:**
+
   $$\text{Bitrate} = \frac{80,000,000}{16 \times 20} = 250,000 \text{ bps} = 250 \text{ kbps}$$
 
 ---
 
 ### Example Configuration: 500 kbps
-Given $f_{CLK} = 80 \text{ MHz}$:
+Given $f_{\text{CLK}} = 80 \text{ MHz}$:
 * **Prescaler Selection:** Set $\text{BRP} = 8 \implies T_q = \frac{8}{80,000,000} = 100 \text{ ns}$
 * **Quanta Allocation:** Set $N_{Tq} = 20$ 
-  $$\text{Sync\_Seg} = 1, \quad \text{Bit\_Seg1} = 15, \quad \text{Bit\_Seg2} = 4$$
-* **Calculation:**
-  $$\text{Bitrate} = \frac{80,000,000}{8 \times 20} = 500,000 \text{ bps} = 500 \text{ kbps}$$
 
+  $$T_{\text{sync}} = 1, \quad T_{\text{seg1}} = 15, \quad T_{\text{seg2}} = 4$$
+
+* **Calculation:**
+
+  $$\text{Bitrate} = \frac{80,000,000}{8 \times 20} = 500,000 \text{ bps} = 500 \text{ kbps}$$
