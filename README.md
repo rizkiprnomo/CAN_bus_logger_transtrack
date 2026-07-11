@@ -45,13 +45,13 @@ TWAI timing parameters are derived from the ESP32 source clock ($f_{\text{CLK}}$
 
    $$T_q = \frac{\text{BRP}}{f_{\text{CLK}}}$$
 
-   *Where $\text{BRP}$ is the Bit Rate Prescaler (integer).*
+   Where $`\text{BRP}`$ is the Bit Rate Prescaler (integer).
 
 2. **Total Number of Quanta per Bit ($N_{Tq}$)**
 
    $$N_{Tq} = T_{\text{sync}} + T_{\text{seg1}} + T_{\text{seg2}}$$
 
-   *(Note: $T_{\text{sync}}$ is always fixed at $1 \cdot T_q$).*
+   Note: $`T_{\text{sync}}`$ is always fixed at $`1 \cdot T_q`$.
 
 3. **Final Bitrate Formula**
 
