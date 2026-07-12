@@ -16,9 +16,8 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 #include "esp_timer.h"
-#include "driver/uart.h"
 
-
+// ========================== PIN CONFIGURATION ==========================
 
 #define SDMMC_CLK_PIN   GPIO_NUM_36
 #define SDMMC_CMD_PIN   GPIO_NUM_35
@@ -35,11 +34,15 @@
 
 #define UART_NUM        UART_NUM_0
 #define UART_BUF_SIZE   1024
+
 #define MOUNT_POINT     "/sdcard"
-#define LOG_FILE_PATH   MOUNT_POINT "/can_log.csv"
+#define BASE_LOG_PATH   "/sdcard/can_%03d.csv"
+
+// ========================== GLOBAL VARIABLES ==========================
 
 sdmmc_card_t *sd_card = NULL;
 static const char *TAG = "CAN_LOGGER";
+
 twai_node_handle_t twai_node = NULL;
 
 typedef struct {
@@ -55,24 +58,27 @@ typedef struct {
     can_flat_frame_t msg;
 } can_log_frame_t;
 
+//Queus
 static QueueHandle_t gpio_evt_queue = NULL;
 QueueHandle_t can_rx_queue; 
+
+// Task handles
 TaskHandle_t can_rx_task_handle = NULL;
 QueueHandle_t sd_log_queue = NULL;
 
-
+// Statistics (atomic for thread safety)
 atomic_uint_fast32_t frames_received = 0;
 atomic_uint_fast32_t frames_dropped = 0;
 atomic_uint_fast32_t write_errors = 0;
 
-#define BASE_LOG_PATH         "/sdcard/can_%03d.csv"
-
+// System state
 volatile bool logging_active = false; 
 volatile int current_file_index = 1;
 volatile bool force_file_rotate = false;
 volatile bool sd_card_not_found = false; 
 volatile bool bus_off_detected = false;  
 
+// LED status
 typedef enum {
     LED_STATUS_STARTUP,    
     LED_STATUS_SD_FAIL,    
@@ -84,13 +90,21 @@ typedef enum {
 
 volatile led_status_t current_led_status = LED_STATUS_LOGGING;
 
+// ========================== FUNCTION PROTOTYPES ==========================
+void decode_j1939_id(uint32_t id);
+void init_twai(void);
+void init_sdmmc(void);
+void init_ui_and_uart(void);
+int scan_next_available_index(void);
+FILE* verify_and_open_csv(bool*);
+
+// ========================== ISR & CALLBACKS ==========================
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
     uint32_t gpio_num = (uint32_t) arg;
     
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
 }
-
 
 static bool IRAM_ATTR twai_listener_on_error_callback(twai_node_handle_t handle, const twai_error_event_data_t *edata, void *user_ctx)
 {
@@ -109,9 +123,7 @@ static bool IRAM_ATTR twai_listener_on_state_change_callback(twai_node_handle_t 
     if (strcmp(current_status, "bus_off") == 0) {
         if (can_rx_task_handle != NULL) {
             BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            
             xTaskNotifyFromISR(can_rx_task_handle, 0x01, eSetBits, &xHigherPriorityTaskWoken);
-            
             return (xHigherPriorityTaskWoken == pdTRUE);
         }
     } 
@@ -147,6 +159,7 @@ static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_
     return (xHigherPriorityTaskWoken == pdTRUE);
 }
 
+// ========================== J1939 HELPER ==========================
 void decode_j1939_id(uint32_t id) {
     
     uint8_t priority = (id >> 26) & 0x07;
@@ -161,6 +174,7 @@ void decode_j1939_id(uint32_t id) {
     printf("--------------------------\n");
 }
 
+// ========================== CAN RX TASK ==========================
 void can_rx_task(void *pvParameters) {
     can_flat_frame_t rx_frame;
     can_log_frame_t log_frame;
@@ -169,6 +183,7 @@ void can_rx_task(void *pvParameters) {
     can_rx_task_handle = xTaskGetCurrentTaskHandle();
 
     while (1) {
+        // Handle Bus-Off recovery notification
         if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, 0) == pdTRUE) {
             if (notification_value & 0x01) {
                 ESP_LOGW("CAN_TASK", "Received Bus-Off signal... Executing twai_node_recover()...");
@@ -183,7 +198,7 @@ void can_rx_task(void *pvParameters) {
         }
 
         if (xQueueReceive(can_rx_queue, &rx_frame, portMAX_DELAY) == pdTRUE) {
-            
+            // Process incoming CAN frames
             if (!logging_active) {
                 continue; 
             }
@@ -206,16 +221,17 @@ void can_rx_task(void *pvParameters) {
     }
 }
 
+// ========================== SD CARD LOG HANDLER ==========================
 FILE* verify_and_open_csv(bool *is_new_file) {
     struct stat st;
     
-    if (stat(LOG_FILE_PATH, &st) == 0) {
+    if (stat(BASE_LOG_PATH, &st) == 0) {
         *is_new_file = false;
     } else {
         *is_new_file = true;
     }
 
-    FILE *f = fopen(LOG_FILE_PATH, "a");
+    FILE *f = fopen(BASE_LOG_PATH, "a");
     if (f == NULL) {
         atomic_fetch_add(&write_errors, 1);
         return NULL;
@@ -230,8 +246,6 @@ FILE* verify_and_open_csv(bool *is_new_file) {
         }
         fflush(f); 
     }
-    
-
     return f;
 }
 
@@ -277,7 +291,7 @@ void log_writer_task(void *pvParameters) {
                 }
                 continue; 
             }
-
+            // Handle file rotation
             if (force_file_rotate) {
                 if (f != NULL) {
                 fclose(f);
@@ -296,7 +310,7 @@ void log_writer_task(void *pvParameters) {
                 sync_counter = 0;
                 force_file_rotate = false;
             }
-
+            // Open file if not open
             if (f == NULL) {
                 snprintf(current_file_path, sizeof(current_file_path), BASE_LOG_PATH, current_file_index);
 
@@ -321,12 +335,12 @@ void log_writer_task(void *pvParameters) {
                     }
                 }
             }
-
+            // Convert data to hex string
             char hex_str[17] = {0}; 
             for (int i = 0; i < log_frame.msg.data_length_code; i++) {
                 sprintf(&hex_str[i * 2], "%02X", log_frame.msg.data[i]);
             }
-
+            // Write CSV line
             int len = snprintf(csv_buffer, sizeof(csv_buffer),
                                "%llu,0x%08lX,%d,%d,%d,%s\n",
                                log_frame.timestamp_us, log_frame.msg.identifier,
@@ -343,7 +357,7 @@ void log_writer_task(void *pvParameters) {
                     sync_counter++;
                 }
             }
-
+            // Periodic sync
             if (sync_counter >= 50) {
                 if (f != NULL) {
                     fclose(f);
@@ -352,6 +366,7 @@ void log_writer_task(void *pvParameters) {
                 sync_counter = 0;
             }
         } else {
+            // Timeout: close file for safety
             if (f != NULL) {
                 fclose(f);
                 f = NULL;
@@ -361,14 +376,14 @@ void log_writer_task(void *pvParameters) {
     }
 }
 
-
+// ========================== BUTTON & UART CONTROL ==========================
 void button_task(void *pvParameters) {
     int last_state = 1;
     
     while (1) {
         int current_state = gpio_get_level(USER_BUTTON_PIN);
 
-        if (last_state == 1 && current_state == 0) {
+        if (last_state == 1 && current_state == 0) {// Button pressed
             vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
             if (gpio_get_level(USER_BUTTON_PIN) == 0) {
                 
@@ -440,8 +455,11 @@ void uart_task(void *pvParameters) {
     }
 }
 
+// ========================== STATUS MONITOR & LED ==========================
 void monitor_status_task(void *pvParameters) {
-
+    gpio_reset_pin(STATUS_LED_PIN);
+    gpio_set_direction(STATUS_LED_PIN, GPIO_MODE_OUTPUT);
+    
     while (1) {
         if (logging_active) {
             printf("\n--- [CAN LOGGER STATUS] ---\n");
@@ -451,11 +469,7 @@ void monitor_status_task(void *pvParameters) {
             printf("---------------------------\n");
         }
 
-         
-        gpio_reset_pin(STATUS_LED_PIN);
-        gpio_set_direction(STATUS_LED_PIN, GPIO_MODE_OUTPUT);
-
-
+        // Update LED status
         if (sd_card_not_found) {
             current_led_status = LED_STATUS_SD_FAIL;
         } else if (bus_off_detected) {
@@ -468,6 +482,7 @@ void monitor_status_task(void *pvParameters) {
             current_led_status = LED_STATUS_IDLE;
         }
         
+        // LED patterns (non-blocking style)
         switch (current_led_status) {
             case LED_STATUS_STARTUP:
                 gpio_set_level(STATUS_LED_PIN, 1);
@@ -507,13 +522,11 @@ void monitor_status_task(void *pvParameters) {
                 vTaskDelay(pdMS_TO_TICKS(600)); 
                 break;
         }
-        
         vTaskDelay(pdMS_TO_TICKS(200)); 
     }
 }
 
-
-
+// ========================== INITIALIZATION FUNCTIONS ==========================
 void init_twai(void) {
     ESP_LOGI(TAG, "Initializing On-Chip TWAI Node with Advanced Timing...");
 
@@ -710,6 +723,8 @@ void init_ui_and_uart(void) {
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "=== CAN Logger Starting ===");
+
     init_twai();
     init_sdmmc();
     init_ui_and_uart();
@@ -719,4 +734,6 @@ void app_main(void)
     xTaskCreatePinnedToCore(log_writer_task, "log_writer_task", 4096, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(monitor_status_task, "status_monitor_t", 2048, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(uart_task, "uart_task", 2048, NULL, 2, NULL, 1);
+
+    ESP_LOGI(TAG, "All tasks started successfully.");
 }

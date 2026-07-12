@@ -4,7 +4,7 @@
 * **CAN Interface (Listen-Only)**:
     * Utilize ESP-IDF TWAI driver.
     * Bitrate must be configurable (250/500 kbps) via Kconfig or NVS.
-    * Implement robust Bus-Off/Error Passive recovery logic; document strategy in README.
+    * Implement robust Bus-Off/Error Passive recovery logic.
 * **Logging Pipeline**:
     * Log format: CSV (`timestamp_us`, `id`, `extended`, `rtr`, `dlc`, `data_hex`).
     * Data path: `can_rx_task` (Producer) -> `xQueue` -> `log_writer_task` (Consumer/SD Writer).
