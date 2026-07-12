@@ -1,4 +1,4 @@
-# Architecture Documentation: High-Performance CAN Bus Logger
+# Architecture Documentation: CAN Bus Logger 
 
 This document outlines the software architecture designed for the CAN Bus Logger system using ESP-IDF. The architecture ensures reliable data logging to local storage (SD Card) without degrading the real-time performance of data reception from the CAN Bus network.
 
