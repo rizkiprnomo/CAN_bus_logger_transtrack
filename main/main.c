@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <sys/stat.h> // Wajib ditambahkan di bagian atas berkas
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,8 +28,8 @@
 #define TWAI_TX_PIN     GPIO_NUM_4
 #define TWAI_RX_PIN     GPIO_NUM_5
 
-#define USER_BUTTON_PIN GPIO_NUM_7
-#define STATUS_LED_PIN  GPIO_NUM_8
+#define USER_BUTTON_PIN GPIO_NUM_1
+#define STATUS_LED_PIN  GPIO_NUM_6
 
 #define UART_NUM        UART_NUM_0
 #define UART_BUF_SIZE   1024
@@ -61,6 +62,12 @@ QueueHandle_t sd_log_queue = NULL;
 atomic_uint_fast32_t frames_received = 0;
 atomic_uint_fast32_t frames_dropped = 0;
 atomic_uint_fast32_t write_errors = 0;
+
+#define BASE_LOG_PATH         "/sdcard/can_%03d.csv"
+
+volatile bool logging_active = false; 
+volatile int current_file_index = 1;
+volatile bool force_file_rotate = false;
 
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
@@ -125,7 +132,6 @@ static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_
     return (xHigherPriorityTaskWoken == pdTRUE);
 }
 
-
 void can_rx_task(void *pvParameters) {
     can_flat_frame_t rx_frame;
     can_log_frame_t log_frame;
@@ -134,12 +140,12 @@ void can_rx_task(void *pvParameters) {
     can_rx_task_handle = xTaskGetCurrentTaskHandle();
 
     while (1) {
+        // 1. Error Handling & Recovery (Tetap terjaga)
         if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, 0) == pdTRUE) {
             if (notification_value & 0x01) {
-                ESP_LOGW("CAN_TASK", "Received Bus-Off signal in Task Context. Executing twai_node_recover()...");
-                
+                ESP_LOGW("CAN_TASK", "Received Bus-Off signal... Executing twai_node_recover()...");
                 if (twai_node_recover(twai_node) == ESP_OK) {
-                    ESP_LOGI("CAN_TASK", "twai_node_recover() successfully triggered. Waiting for 129 recessive sequences...");
+                    ESP_LOGI("CAN_TASK", "twai_node_recover() successful.");
                 } else {
                     ESP_LOGE("CAN_TASK", "Failed to execute twai_node_recover()!");
                 }
@@ -147,6 +153,16 @@ void can_rx_task(void *pvParameters) {
         }
 
         if (xQueueReceive(can_rx_queue, &rx_frame, portMAX_DELAY) == pdTRUE) {
+            
+            if (!logging_active) {
+                continue; 
+            }
+
+            if (force_file_rotate) {
+                frames_received = 0;
+                frames_dropped = 0;
+            }
+
             atomic_fetch_add(&frames_received, 1);
     
             log_frame.timestamp_us = esp_timer_get_time();
@@ -159,11 +175,13 @@ void can_rx_task(void *pvParameters) {
     }
 }
 
-FILE* verify_and_open_csv(bool *file_exists) {
-    FILE *check_f = fopen(LOG_FILE_PATH, "r");
-    *file_exists = (check_f != NULL);
-    if (*file_exists) {
-        fclose(check_f);
+FILE* verify_and_open_csv(bool *is_new_file) {
+    struct stat st;
+    
+    if (stat(LOG_FILE_PATH, &st) == 0) {
+        *is_new_file = false;
+    } else {
+        *is_new_file = true;
     }
 
     FILE *f = fopen(LOG_FILE_PATH, "a");
@@ -172,45 +190,103 @@ FILE* verify_and_open_csv(bool *file_exists) {
         return NULL;
     }
 
-    if (!(*file_exists)) {
+    if (*is_new_file) {
         const char *header = "timestamp_us,id,extended,rtr,dlc,data_hex\n";
         if (fwrite(header, 1, strlen(header), f) != strlen(header)) {
             atomic_fetch_add(&write_errors, 1);
             fclose(f);
             return NULL;
         }
-        fflush(f);
+        fflush(f); 
     }
+
     return f;
 }
 
+int scan_next_available_index(void) {
+    int index = 1;
+    char path_buffer[64];
+    struct stat st;
+
+    while (1) {
+        snprintf(path_buffer, sizeof(path_buffer), BASE_LOG_PATH, index);
+        
+        if (stat(path_buffer, &st) != 0) {
+            return index;
+        }
+        
+        if (st.st_size == 0) {
+            return index;
+        }
+
+        index++;
+    }
+}
 
 void log_writer_task(void *pvParameters) {
     can_log_frame_t log_frame;
     char csv_buffer[128];
+    char current_file_path[64];
     int sync_counter = 0;
     FILE *f = NULL;
     bool sd_healthy = true;
 
+    vTaskDelay(pdMS_TO_TICKS(200)); 
+    current_file_index = scan_next_available_index();
+    ESP_LOGI("SD_INIT", "Initial index file ready for use: can_%03d.csv", current_file_index);
+
     while (1) {
         if (xQueueReceive(sd_log_queue, &log_frame, pdMS_TO_TICKS(500)) == pdTRUE) {
             
-            if (!sd_healthy) {
-                f = verify_and_open_csv(&sd_healthy);
-                if (f == NULL) {
-                    sd_healthy = false;
-                    atomic_fetch_add(&write_errors, 1);
-                    continue; 
+            if (!logging_active) {
+                if (f != NULL) {
+                    fclose(f); 
+                    f = NULL;
                 }
-                sd_healthy = true;
+                continue; 
+            }
+
+            if (force_file_rotate) {
+                if (f != NULL) {
+                fclose(f);
+                f = NULL;
+            }
+                sync_counter = 0;
+    
+                force_file_rotate = false; 
+            }
+
+            if (force_file_rotate) {
+                if (f != NULL) {
+                    fclose(f);
+                    f = NULL;
+                }
+                sync_counter = 0;
+                force_file_rotate = false;
             }
 
             if (f == NULL) {
-                bool exists = false;
-                f = verify_and_open_csv(&exists);
+                snprintf(current_file_path, sizeof(current_file_path), BASE_LOG_PATH, current_file_index);
+
+                struct stat st;
+                bool need_header = (stat(current_file_path, &st) != 0 || st.st_size == 0);
+
+                f = fopen(current_file_path, "a");
                 if (f == NULL) {
                     sd_healthy = false;
-                    continue;
+                    atomic_fetch_add(&write_errors, 1);
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue; 
+                }
+                sd_healthy = true;
+
+                if (need_header) {
+                    const char *header = "timestamp_us,id,extended,rtr,dlc,data_hex\n";
+                    if (fwrite(header, 1, strlen(header), f) == strlen(header)) {
+                        fflush(f);
+                    } else {
+                        atomic_fetch_add(&write_errors, 1);
+                    }
                 }
             }
 
@@ -231,7 +307,6 @@ void log_writer_task(void *pvParameters) {
                     fclose(f);
                     f = NULL;
                     sd_healthy = false; 
-                    ESP_LOGE(TAG, "Failed to write to the SD card; the media might have been removed or is full!");
                 } else {
                     sync_counter++;
                 }
@@ -254,19 +329,52 @@ void log_writer_task(void *pvParameters) {
     }
 }
 
-void status_monitor_task(void *pvParameters) {
+
+void button_task(void *pvParameters) {
+    int last_state = 1;
+    
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(2000)); 
+        int current_state = gpio_get_level(USER_BUTTON_PIN);
+
+        if (last_state == 1 && current_state == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
+            if (gpio_get_level(USER_BUTTON_PIN) == 0) {
+                
+                logging_active = !logging_active;
+
+                if (logging_active) {
+                    current_file_index = scan_next_available_index();
+                    force_file_rotate = true; 
+                    ESP_LOGI("BUTTON", "Logging STARTED -> Target File: can_%03d.csv", current_file_index);
+                } else {
+                    ESP_LOGW("BUTTON", "Logging STOPPED");
+                    frames_received = 0;
+                    frames_dropped = 0;
+                }
+                
+                while (gpio_get_level(USER_BUTTON_PIN) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+            }
+        }
         
-        printf("\n--- [CAN LOGGER STATUS] ---\n");
-        printf("Frames Received : %d\n", frames_received);
-        printf("Frames Dropped  : %d\n", frames_dropped);
-        printf("Write Errors    : %d\n", write_errors);
-        printf("Queue Available : %d/%d\n", 
-               (int)uxQueueSpacesAvailable(sd_log_queue), 
-               100); 
-        printf("---------------------------\n");
+        last_state = current_state;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+
+void monitor_status_task(void *pvParameters) {
+    while (1) {
+        if (logging_active) {
+            printf("\n--- [CAN LOGGER STATUS] ---\n");
+            printf("Frames Received : %d\n", frames_received);
+            printf("Frames Dropped  : %d\n", frames_dropped);
+            printf("Write Errors    : %d\n", write_errors);
+            printf("---------------------------\n");
+        }
         
+        vTaskDelay(pdMS_TO_TICKS(1000)); 
     }
 }
 
@@ -379,7 +487,6 @@ void init_sdmmc(void) {
     }
 }
 
-
 void init_ui_and_uart(void) {
     esp_err_t ret;
     bool ui_success = true;
@@ -442,14 +549,14 @@ void init_ui_and_uart(void) {
 }
 
 
-
 void app_main(void)
 {
     init_twai();
     init_sdmmc();
     init_ui_and_uart();
-    
+
+    xTaskCreatePinnedToCore(button_task, "button_task", 4096, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(can_rx_task, "can_rx_task", 3072, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(log_writer_task, "log_writer_task", 4096, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(status_monitor_task, "status_monitor_t", 2048, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(monitor_status_task, "status_monitor_t", 2048, NULL, 2, NULL, 1);
 }
