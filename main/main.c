@@ -68,6 +68,19 @@ atomic_uint_fast32_t write_errors = 0;
 volatile bool logging_active = false; 
 volatile int current_file_index = 1;
 volatile bool force_file_rotate = false;
+volatile bool sd_card_not_found = false; // Flag error mount SD
+volatile bool bus_off_detected = false;  // Flag error CAN Bus-Off
+
+typedef enum {
+    LED_STATUS_STARTUP,    // Solid ON saat booting
+    LED_STATUS_SD_FAIL,    // Pola SOS (3 kedipan pendek)
+    LED_STATUS_IDLE,       // Slow blink
+    LED_STATUS_LOGGING,    // Heartbeat/Fast blink
+    LED_STATUS_BUS_OFF,    // Solid OFF (atau pola khusus)
+    LED_STATUS_ERROR       // Double blink
+} led_status_t;
+
+volatile led_status_t current_led_status = LED_STATUS_IDLE;
 
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
@@ -145,8 +158,10 @@ void can_rx_task(void *pvParameters) {
             if (notification_value & 0x01) {
                 ESP_LOGW("CAN_TASK", "Received Bus-Off signal... Executing twai_node_recover()...");
                 if (twai_node_recover(twai_node) == ESP_OK) {
+                    bus_off_detected = true; 
                     ESP_LOGI("CAN_TASK", "twai_node_recover() successful.");
                 } else {
+                    bus_off_detected = false;
                     ESP_LOGE("CAN_TASK", "Failed to execute twai_node_recover()!");
                 }
             }
@@ -199,6 +214,7 @@ FILE* verify_and_open_csv(bool *is_new_file) {
         }
         fflush(f); 
     }
+    
 
     return f;
 }
@@ -350,6 +366,7 @@ void button_task(void *pvParameters) {
                     ESP_LOGW("BUTTON", "Logging STOPPED");
                     frames_received = 0;
                     frames_dropped = 0;
+                    write_errors = 0;
                 }
                 
                 while (gpio_get_level(USER_BUTTON_PIN) == 0) {
@@ -357,12 +374,69 @@ void button_task(void *pvParameters) {
                 }
             }
         }
-        
         last_state = current_state;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
+void led_status_task(void *pvParameters) {
+    gpio_reset_pin(STATUS_LED_PIN);
+    gpio_set_direction(STATUS_LED_PIN, GPIO_MODE_OUTPUT);
+
+    while (1) {
+        // Tentukan status berdasarkan logika global
+        if (sd_card_not_found) {
+            current_led_status = LED_STATUS_SD_FAIL;
+        } else if (bus_off_detected) {
+            current_led_status = LED_STATUS_BUS_OFF;
+        } else if (write_errors > 0) {
+            current_led_status = LED_STATUS_ERROR;
+        } else if (logging_active) {
+            current_led_status = LED_STATUS_LOGGING;
+        } else {
+            current_led_status = LED_STATUS_IDLE;
+        }
+
+        // Jalankan pola kedipan
+        switch (current_led_status) {
+            case LED_STATUS_STARTUP:
+                gpio_set_level(STATUS_LED_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                break;
+
+            case LED_STATUS_SD_FAIL: // SOS Pattern (3 pendek, 3 panjang, 3 pendek)
+                for(int i=0; i<3; i++) { // 3 pendek
+                    gpio_set_level(STATUS_LED_PIN, 1); vTaskDelay(100); gpio_set_level(STATUS_LED_PIN, 0); vTaskDelay(100);
+                }
+                vTaskDelay(pdMS_TO_TICKS(500));
+                break;
+
+            case LED_STATUS_BUS_OFF: // Pola OFF atau nyala sangat redup
+                gpio_set_level(STATUS_LED_PIN, 0); 
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                break;
+
+            case LED_STATUS_IDLE: // Slow blink 1x per detik
+                gpio_set_level(STATUS_LED_PIN, 1); vTaskDelay(200); gpio_set_level(STATUS_LED_PIN, 0); vTaskDelay(800);
+                break;
+
+            case LED_STATUS_LOGGING: // Fast heartbeat
+                gpio_set_level(STATUS_LED_PIN, 1); vTaskDelay(50); gpio_set_level(STATUS_LED_PIN, 0); vTaskDelay(250);
+                break;
+
+            case LED_STATUS_ERROR: // Double Blink (Peringatan Error)
+                gpio_set_level(STATUS_LED_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                gpio_set_level(STATUS_LED_PIN, 0);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                gpio_set_level(STATUS_LED_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                gpio_set_level(STATUS_LED_PIN, 0);
+                vTaskDelay(pdMS_TO_TICKS(600)); // Jeda sebelum mengulang pola
+                break;
+        }
+    }
+}
 
 void monitor_status_task(void *pvParameters) {
     while (1) {
@@ -402,6 +476,18 @@ void init_twai(void) {
         ESP_LOGE(TAG, "Failed to create TWAI node: %s", esp_err_to_name(ret));
         return;
     }
+
+    twai_mask_filter_config_t j1939_filter;
+    j1939_filter = twai_make_dual_filter(
+        0x0CF0, // ID 1 
+        0xFFFF, // Mask 1 
+        0x0000, // ID 2 
+        0x0000, // Mask 2 
+        true    // is_ext = true (for J1939)
+    );
+
+    ESP_ERROR_CHECK(twai_node_config_mask_filter(twai_node, 0, &j1939_filter));
+    ESP_LOGI(TAG, "Filter enabled for ID: 0x%03X Mask: 0x%03X", j1939_filter.id, j1939_filter.mask);
     
     twai_timing_advanced_config_t timing_cfg;
     
@@ -413,7 +499,7 @@ void init_twai(void) {
         timing_cfg.sjw = 3;
         timing_cfg.ssp_offset=0;
         ESP_LOGI(TAG, "Applying Advanced Timing: 500kbps (BRP:8,prop seg:10, Tseg1:4, Tseg2:5)");
-    } else {
+    } else if(CONFIG_TWAI_BITRATE_VALUE == 250000) {
         timing_cfg.brp = 16;
         timing_cfg.prop_seg =10;
         timing_cfg.tseg_1 = 4;
@@ -480,9 +566,11 @@ void init_sdmmc(void) {
     
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "SD Card initialization: SUCCESSFUL.");
+        sd_card_not_found = true;
         sdmmc_card_print_info(stdout, sd_card); 
     } else {
         sd_card = NULL; 
+        sd_card_not_found = false;
         ESP_LOGE(TAG, "SD Card initialization: FAILED (%s). The device continues to operate without logging functionality.", esp_err_to_name(ret));
     }
 }
@@ -559,4 +647,5 @@ void app_main(void)
     xTaskCreatePinnedToCore(can_rx_task, "can_rx_task", 3072, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(log_writer_task, "log_writer_task", 4096, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(monitor_status_task, "status_monitor_t", 2048, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(led_status_task, "led_status_task", 2048, NULL, 2, NULL, 1);
 }
