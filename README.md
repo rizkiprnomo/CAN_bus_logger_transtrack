@@ -89,7 +89,21 @@ $$\text{Bitrate} = \frac{80,000,000}{8 \times (1 + 10 + 4 + 5)} = 500,000 \text{
 
 $$\text{Sample Point} = \frac{1 + 10 + 4}{20} = \frac{15}{20} = 75\% $$
 
-## 3. Generating Test CAN Traffic Without a Vehicle (STM32 Simulator)
+## 3. System Status LED Indicators
+To provide real-time visual feedback on the system's operational state without requiring an active serial debugger console, the ESP32 controls a single status LED using a dedicated FreeRTOS task (led_status_task).
+
+
+| LED Status (`current_led_status`) | Trigger Condition (Global Logic) | Blink Pattern Description | Total Duration Per Cycle |
+| :--- | :--- | :--- | :--- |
+| **`LED_STATUS_SD_FAIL`** | `sd_card_not_found == true` | **SOS Pattern**:<br>• 3x short blinks (100ms ON, 100ms OFF)<br>• End-of-pattern delay 500ms | ~1100 ms |
+| **`LED_STATUS_BUS_OFF`** | `bus_off_detected == true` | **Solid OFF**:<br>• LED is turned off continuously with a 1000ms delay | 1000 ms |
+| **`LED_STATUS_ERROR`** | `write_errors > 0` | **Double Blink**:<br>• 2x blinks (200ms ON, 200ms OFF, 200ms ON, 200ms OFF)<br>• End-of-pattern delay 600ms | 1200 ms |
+| **`LED_STATUS_LOGGING`** | `logging_active == true` | **Fast Heartbeat**:<br>• Fast blinking (50ms ON, 250ms OFF) | 300 ms |
+| **`LED_STATUS_IDLE`** | Default condition (no active errors/tasks) | **Slow Blink**:<br>• Slow blink 1x per second (200ms ON, 800ms OFF) | 1000 ms |
+| **`LED_STATUS_STARTUP`** | Outside the main `if-else` logic | **Solid ON**:<br>• LED stays ON continuously for 2000ms | 2000 ms |
+
+
+## 4. Generating Test CAN Traffic Without a Vehicle (STM32 Simulator)
 
 Performing live on-site testing directly on vehicle fleets or heavy machinery carries safety risks and is highly impractical during the early phases of firmware development. To overcome these constraints, we can build a standalone CAN Bus Simulator capable of precisely playing back real telemetry data captured from actual field units.
 
@@ -157,3 +171,4 @@ The CSV files on the SD card contain real-world telemetry logs captured from the
     * Data Logs: Contains hook load-cell sensor measurements, main hydraulic pump pressures, boom/arm motion angles, and operational safety indicators (Limit Switches).
 
 By leveraging this STM32-based simulator, testing the ESP32's TWAI data-parsing logic can be conducted safely and comprehensively on your workbench using authentic, production-grade field data.
+
