@@ -41,44 +41,50 @@ TWAI timing parameters are derived from the ESP32 source clock ($f_{\text{CLK}}$
 
 ### Mathematical Formulas
 
-1. **Time Quantum ($T_q$)**
+1. Time Quantum Length ($`T_q`$)
 
-   $$T_q = \frac{\text{BRP}}{f_{\text{CLK}}}$$
+The duration of one Time Quantum is determined by the Bit Rate Prescaler ($`\text{BRP}`$):
 
-   Where $`\text{BRP}`$ is the Bit Rate Prescaler (integer).
+$$T_q = \frac{\text{BRP}}{f_{\text{CLK}}}$$
 
-2. **Total Number of Quanta per Bit ($N_{Tq}$)**
+2. Output Bitrate Formula (ESP-IDF Official)
 
-   $$N_{Tq} = T_{\text{sync}} + T_{\text{seg1}} + T_{\text{seg2}}$$
+Using the official ESP-IDF register definitions where $`T_{\text{seg1}} = \text{prop\_seg} + \text{tseg}_1`$ and $`T_{\text{seg2}} = \text{tseg}_2`$:
 
-   Note: $`T_{\text{sync}}`$ is always fixed at $`1 \cdot T_q`$.
+$$\text{Bitrate} = \frac{f_{\text{CLK}}}{\text{BRP} \times (1 + \text{prop\_seg} + \text{tseg}_1 + \text{tseg}_2)}$$
 
-3. **Final Bitrate Formula**
+3. Sample Point Formula
 
-   $$\text{Bitrate} = \frac{1}{N_{Tq} \times T_q} = \frac{f_{\text{CLK}}}{\text{BRP} \times N_{Tq}}$$
+$$\text{Sample Point} = \frac{1 + \text{prop\_seg} + \text{tseg}_1}{1 + \text{prop\_seg} + \text{tseg}_1 + \text{tseg}_2}$$
 
----
+Example Configuration: 250 kbps
 
-### Example Configuration: 250 kbps
-Given $f_{\text{CLK}} = 80 \text{ MHz}$:
-* **Prescaler Selection:** Set $\text{BRP} = 16 \implies T_q = \frac{16}{80,000,000} = 200 \text{ ns}$
-* **Quanta Allocation:** Set $N_{Tq} = 20$ 
+Given $`f_{\text{CLK}} = 80 \text{ MHz}`$: 1. Prescaler Setup: Choose $`\text{BRP} = 16 \implies T_q = 200 \text{ ns}`$ 2. Quanta Allocation: Divide the single bit duration into $`20 \cdot T_q`$:
 
-  $$T_{\text{sync}} = 1, \quad T_{\text{seg1}} = 15, \quad T_{\text{seg2}} = 4$$
+$`\text{prop\_seg} = 10`$
 
-* **Calculation:**
+$`\text{tseg}_1 = 4`$
 
-  $$\text{Bitrate} = \frac{80,000,000}{16 \times 20} = 250,000 \text{ bps} = 250 \text{ kbps}$$
+$`\text{tseg}_2 = 5`$
 
----
+Verify Bitrate & Sample Point:
 
-### Example Configuration: 500 kbps
-Given $f_{\text{CLK}} = 80 \text{ MHz}$:
-* **Prescaler Selection:** Set $\text{BRP} = 8 \implies T_q = \frac{8}{80,000,000} = 100 \text{ ns}$
-* **Quanta Allocation:** Set $N_{Tq} = 20$ 
+$$\text{Bitrate} = \frac{80,000,000}{16 \times (1 + 10 + 4 + 5)} = 250,000 \text{ bps} = 250 \text{ kbps}$$
 
-  $$T_{\text{sync}} = 1, \quad T_{\text{seg1}} = 15, \quad T_{\text{seg2}} = 4$$
+$$\text{Sample Point} = \frac{1 + 10 + 4}{20} = \frac{15}{20} = 75\%$$
 
-* **Calculation:**
+Example Configuration: 500 kbps
 
-  $$\text{Bitrate} = \frac{80,000,000}{8 \times 20} = 500,000 \text{ bps} = 500 \text{ kbps}$$
+Given $`f_{\text{CLK}} = 80 \text{ MHz}`$: 1. Prescaler Setup: Choose $`\text{BRP} = 8 \implies T_q = 100 \text{ ns}`$ 2. Quanta Allocation: Divide the single bit duration into $`20 \cdot T_q`$:
+
+$`\text{prop\_seg} = 10`$
+
+$`\text{tseg}_1 = 4`$
+
+$`\text{tseg}_2 = 5`$
+
+Verify Bitrate & Sample Point:
+
+$$\text{Bitrate} = \frac{80,000,000}{8 \times (1 + 10 + 4 + 5)} = 500,000 \text{ bps} = 500 \text{ kbps}$$
+
+$$\text{Sample Point} = \frac{1 + 10 + 4}{20} = \frac{15}{20} = 75\%$$
