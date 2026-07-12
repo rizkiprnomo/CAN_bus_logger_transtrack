@@ -54,7 +54,9 @@ typedef struct {
 
 static QueueHandle_t gpio_evt_queue = NULL;
 QueueHandle_t can_rx_queue; 
+TaskHandle_t can_rx_task_handle = NULL;
 QueueHandle_t sd_log_queue = NULL;
+
 
 atomic_uint_fast32_t frames_received = 0;
 atomic_uint_fast32_t frames_dropped = 0;
@@ -67,6 +69,7 @@ static void IRAM_ATTR gpio_isr_handler(void* arg)
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
 }
 
+
 static bool IRAM_ATTR twai_listener_on_error_callback(twai_node_handle_t handle, const twai_error_event_data_t *edata, void *user_ctx)
 {
     ESP_EARLY_LOGW(TAG, "bus error: 0x%x", edata->err_flags.val);
@@ -75,8 +78,25 @@ static bool IRAM_ATTR twai_listener_on_error_callback(twai_node_handle_t handle,
 
 static bool IRAM_ATTR twai_listener_on_state_change_callback(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
 {
-    const char *twai_state_name[] = {"error_active", "error_warning", "error_passive", "bus_off"};
+    const char *twai_state_name[] = {"active", "warning", "passive", "bus_off"};
+    
     ESP_EARLY_LOGI(TAG, "state changed: %s -> %s", twai_state_name[edata->old_sta], twai_state_name[edata->new_sta]);
+
+    const char *current_status = twai_state_name[edata->new_sta];
+
+    if (strcmp(current_status, "bus_off") == 0) {
+        if (can_rx_task_handle != NULL) {
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            
+            xTaskNotifyFromISR(can_rx_task_handle, 0x01, eSetBits, &xHigherPriorityTaskWoken);
+            
+            return (xHigherPriorityTaskWoken == pdTRUE);
+        }
+    } 
+    else if (strcmp(current_status, "active") == 0) {
+        ESP_EARLY_LOGI(TAG, "The TWAI driver successfully recovered and is back ONLINE (Active).");
+    }
+    
     return false;
 }
 
@@ -109,8 +129,23 @@ static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_
 void can_rx_task(void *pvParameters) {
     can_flat_frame_t rx_frame;
     can_log_frame_t log_frame;
+    uint32_t notification_value = 0;
+
+    can_rx_task_handle = xTaskGetCurrentTaskHandle();
 
     while (1) {
+        if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, 0) == pdTRUE) {
+            if (notification_value & 0x01) {
+                ESP_LOGW("CAN_TASK", "Received Bus-Off signal in Task Context. Executing twai_node_recover()...");
+                
+                if (twai_node_recover(twai_node) == ESP_OK) {
+                    ESP_LOGI("CAN_TASK", "twai_node_recover() successfully triggered. Waiting for 129 recessive sequences...");
+                } else {
+                    ESP_LOGE("CAN_TASK", "Failed to execute twai_node_recover()!");
+                }
+            }
+        }
+
         if (xQueueReceive(can_rx_queue, &rx_frame, portMAX_DELAY) == pdTRUE) {
             atomic_fetch_add(&frames_received, 1);
     
@@ -124,33 +159,61 @@ void can_rx_task(void *pvParameters) {
     }
 }
 
+FILE* verify_and_open_csv(bool *file_exists) {
+    FILE *check_f = fopen(LOG_FILE_PATH, "r");
+    *file_exists = (check_f != NULL);
+    if (*file_exists) {
+        fclose(check_f);
+    }
+
+    FILE *f = fopen(LOG_FILE_PATH, "a");
+    if (f == NULL) {
+        atomic_fetch_add(&write_errors, 1);
+        return NULL;
+    }
+
+    if (!(*file_exists)) {
+        const char *header = "timestamp_us,id,extended,rtr,dlc,data_hex\n";
+        if (fwrite(header, 1, strlen(header), f) != strlen(header)) {
+            atomic_fetch_add(&write_errors, 1);
+            fclose(f);
+            return NULL;
+        }
+        fflush(f);
+    }
+    return f;
+}
+
+
 void log_writer_task(void *pvParameters) {
     can_log_frame_t log_frame;
     char csv_buffer[128];
     int sync_counter = 0;
-
-    FILE *f = NULL; 
+    FILE *f = NULL;
+    bool sd_healthy = true;
 
     while (1) {
         if (xQueueReceive(sd_log_queue, &log_frame, pdMS_TO_TICKS(500)) == pdTRUE) {
             
-            if (f == NULL) {
-                FILE *check_f = fopen(LOG_FILE_PATH, "r");
-                bool file_exists = (check_f != NULL);
-                if (file_exists) fclose(check_f);
-
-                f = fopen(LOG_FILE_PATH, "a");
+            if (!sd_healthy) {
+                f = verify_and_open_csv(&sd_healthy);
                 if (f == NULL) {
+                    sd_healthy = false;
                     atomic_fetch_add(&write_errors, 1);
                     continue; 
                 }
+                sd_healthy = true;
+            }
 
-                if (!file_exists) {
-                    const char *header = "timestamp_us,id,extended,rtr,dlc,data_hex\n";
-                    fwrite(header, 1, strlen(header), f);
-                    fflush(f);
+            if (f == NULL) {
+                bool exists = false;
+                f = verify_and_open_csv(&exists);
+                if (f == NULL) {
+                    sd_healthy = false;
+                    continue;
                 }
             }
+
             char hex_str[17] = {0}; 
             for (int i = 0; i < log_frame.msg.data_length_code; i++) {
                 sprintf(&hex_str[i * 2], "%02X", log_frame.msg.data[i]);
@@ -158,24 +221,27 @@ void log_writer_task(void *pvParameters) {
 
             int len = snprintf(csv_buffer, sizeof(csv_buffer),
                                "%llu,0x%08lX,%d,%d,%d,%s\n",
-                               log_frame.timestamp_us,
-                               log_frame.msg.identifier,
-                               log_frame.msg.extd,
-                               log_frame.msg.rtr,
-                               log_frame.msg.data_length_code,
-                               hex_str);
+                               log_frame.timestamp_us, log_frame.msg.identifier,
+                               log_frame.msg.extd, log_frame.msg.rtr,
+                               log_frame.msg.data_length_code, hex_str);
 
             if (len > 0 && f != NULL) {
                 if (fwrite(csv_buffer, 1, len, f) != len) {
                     atomic_fetch_add(&write_errors, 1);
+                    fclose(f);
+                    f = NULL;
+                    sd_healthy = false; 
+                    ESP_LOGE(TAG, "Failed to write to the SD card; the media might have been removed or is full!");
                 } else {
                     sync_counter++;
                 }
             }
 
             if (sync_counter >= 50) {
-                fclose(f);
-                f = NULL; 
+                if (f != NULL) {
+                    fclose(f);
+                    f = NULL;
+                }
                 sync_counter = 0;
             }
         } else {
@@ -186,8 +252,6 @@ void log_writer_task(void *pvParameters) {
             }
         }
     }
-    if (f != NULL) fclose(f);
-    vTaskDelete(NULL);
 }
 
 void status_monitor_task(void *pvParameters) {
