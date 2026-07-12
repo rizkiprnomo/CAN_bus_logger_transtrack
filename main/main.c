@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -13,7 +15,7 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 #include "esp_timer.h"
-#include <stdatomic.h>
+
 
 #define SDMMC_CLK_PIN   GPIO_NUM_36
 #define SDMMC_CMD_PIN   GPIO_NUM_35
@@ -211,7 +213,7 @@ void init_twai(void) {
     sd_log_queue = xQueueCreate(100, sizeof(can_log_frame_t));
 
     if (can_rx_queue == NULL || sd_log_queue == NULL) {
-        ESP_LOGE("MAIN", "Gagal mengalokasikan Queue!");
+        ESP_LOGE("MAIN", "Failed to allocate Queue!");
         return;
     }
 
