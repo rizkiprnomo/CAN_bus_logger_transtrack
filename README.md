@@ -51,11 +51,11 @@ $$T_q = \frac{\text{BRP}}{f_{\text{CLK}}}$$
 
 Using the official ESP-IDF register definitions where $`T_{\text{seg1}} = \text{prop\_seg} + \text{tseg}_1`$ and $`T_{\text{seg2}} = \text{tseg}_2`$:
 
-$$\text{Bitrate} = \frac{f_{\text{CLK}}}{\text{BRP} \times (1 + \text{prop\_seg} + \text{tseg}_1 + \text{tseg}_2)}$$
+$$\text{Bitrate} = \frac{f_{\text{CLK}}}{\text{BRP} \times (1 + \text{prop}_{\text{seg}} + \text{tseg}_1 + \text{tseg}_2)}$$
 
 3. Sample Point Formula
 
-$$\text{Sample Point} = \frac{1 + \text{prop\_seg} + \text{tseg}_1}{1 + \text{prop\_seg} + \text{tseg}_1 + \text{tseg}_2}$$
+$$\text{Sample Point} = \frac{1 + \text{prop}_{\text{seg}} + \text{tseg}_1}{1 + \text{prop}_{\text{seg}} + \text{tseg}_1 + \text{tseg}_2}$$
 
 Example Configuration: 250 kbps
 
