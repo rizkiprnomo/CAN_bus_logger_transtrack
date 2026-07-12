@@ -87,4 +87,4 @@ Verify Bitrate & Sample Point:
 
 $$\text{Bitrate} = \frac{80,000,000}{8 \times (1 + 10 + 4 + 5)} = 500,000 \text{ bps} = 500 \text{ kbps}$$
 
-$$\text{Sample Point} = \frac{1 + 10 + 4}{20} = \frac{15}{20} = 75\char37$$
+$$\text{Sample Point} = \frac{1 + 10 + 4}{20} = \frac{15}{20} = 75\%$$
