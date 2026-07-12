@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
-#include <sys/stat.h> // Wajib ditambahkan di bagian atas berkas
+#include <sys/stat.h> 
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
