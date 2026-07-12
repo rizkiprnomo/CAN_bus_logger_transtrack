@@ -71,7 +71,7 @@ Verify Bitrate & Sample Point:
 
 $$\text{Bitrate} = \frac{80,000,000}{16 \times (1 + 10 + 4 + 5)} = 250,000 \text{ bps} = 250 \text{ kbps}$$
 
-$$\text{Sample Point} = \frac{1 + 10 + 4}{20} = \frac{15}{20} = 75\char37$$
+$$\text{Sample Point} = \frac{1 + 10 + 4}{20} = \frac{15}{20} = 75\%$$
 
 Example Configuration: 500 kbps
 
@@ -87,4 +87,73 @@ Verify Bitrate & Sample Point:
 
 $$\text{Bitrate} = \frac{80,000,000}{8 \times (1 + 10 + 4 + 5)} = 500,000 \text{ bps} = 500 \text{ kbps}$$
 
-$$\text{Sample Point} = \frac{1 + 10 + 4}{20} = \frac{15}{20} = 75\%$$
+$$\text{Sample Point} = \frac{1 + 10 + 4}{20} = \frac{15}{20} = 75\% $$
+
+## 3. Generating Test CAN Traffic Without a Vehicle (STM32 Simulator)
+
+Performing live on-site testing directly on vehicle fleets or heavy machinery carries safety risks and is highly impractical during the early phases of firmware development. To overcome these constraints, we can build a standalone CAN Bus Simulator capable of precisely playing back real telemetry data captured from actual field units.
+
+### Hardware Simulator Setup
+
+This simulator is built using an STM32F407VET6 microcontroller connected to a TJA1050 transceiver and an SD Card Reader module (utilizing high-speed SDIO/SPI protocols).
+```text
+
+  +--------------------------------------------------------+
+  |                   STM32F407VET6 BOARD                  |
+  |                                                        |
+  |  [ SD Card ] ---> Reads CSV Log Files from Field Units |
+  |                                                        |
+  |  CAN_TX (PB9) X----------> TXD [ TJA1050 Transceiver ] |
+  |  CAN_RX (PB8) <----------  RXD [   (Simulator Node)  ] |
+  +--------------------------------------------------------+
+                                       |
+                                CAN_H / CAN_L (Bus Link)
+                                       |
+  +--------------------------------------------------------+
+  |                  ESP32 / ESP32-S3 BOARD                |
+  |                                                        |
+  |  GPIO 4 (TX)  X----------> TXD [  TJA1050 Transceiver] |
+  |  GPIO 5 (RX)  <----------  RXD [   (Receiver Node)   ] |
+  |                                                        |
+  |  [ TWAI Driver ] ---> Receives & Validates Data Packets|
+  +--------------------------------------------------------+
+```
+
+### Simulator Working Mechanism
+
+1. SD Card Initialization: The STM32 initializes the high-speed SDIO/SPI connection to read the FAT32-formatted SD card and search for the designated raw CSV telemetry logs.
+
+2. CSV Parsing: The simulator reads the data line-by-line, extracting essential packet properties:
+
+3. Bitrate: Configures the initialization parameters of the STM32's internal bxCAN hardware module (250 kbps or 500 kbps).
+
+4. CAN ID: The frame identifier (Standard 11-bit or Extended 29-bit).
+
+5. DLC (Data Length Code): The number of data bytes in the frame (0 to 8 bytes).
+
+6. Data Bytes: The actual sensor hexadecimal payloads exported from real machinery.
+
+7. Payload Broadcasting: The STM32 transmits the reconstructed packets onto the physical network via the TJA1050 transceiver, allowing the receiving ESP32 node to read, parse, and process them as if it were connected directly to an active vehicle.
+
+### Field Unit Telemetry Logging Profiles (SD Card Dataset)
+
+The CSV files on the SD card contain real-world telemetry logs captured from the following machinery units:
+
+1. VOLVO FMX420 (Heavy Duty Truck):
+   * Characteristics: Runs on the J1939 protocol with a standard bitrate of 500 kbps (29-bit Extended ID).
+
+   * Data Logs: Contains engine telemetry (RPM, torque parameters), engine coolant temperature, engine oil pressure, accelerator pedal position, odometer status, and real-time fuel consumption rates.
+
+2. VOLVO ADT (Articulated Dump Truck):
+
+   * Characteristics: Utilizes a multi-node CAN architecture at a 250 kbps bitrate.
+
+    * Data Logs: Contains the status of the dump body articulation hydraulics, truck bed tilt angles, transmission temperature sensors, brake pressures, and differential gear lock statuses (diff_lock).
+
+3. XCMG (Heavy Machinery - Excavator/Crane):
+
+    * Characteristics: Employs customized CANopen/J1939 architectures running at 250 kbps.
+
+    * Data Logs: Contains hook load-cell sensor measurements, main hydraulic pump pressures, boom/arm motion angles, and operational safety indicators (Limit Switches).
+
+By leveraging this STM32-based simulator, testing the ESP32's TWAI data-parsing logic can be conducted safely and comprehensively on your workbench using authentic, production-grade field data.
