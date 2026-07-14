@@ -294,22 +294,14 @@ void log_writer_task(void *pvParameters) {
             // Handle file rotation
             if (force_file_rotate) {
                 if (f != NULL) {
-                fclose(f);
-                f = NULL;
-            }
+                    fclose(f);
+                    f = NULL;
+                }
                 sync_counter = 0;
     
                 force_file_rotate = false; 
             }
 
-            if (force_file_rotate) {
-                if (f != NULL) {
-                    fclose(f);
-                    f = NULL;
-                }
-                sync_counter = 0;
-                force_file_rotate = false;
-            }
             // Open file if not open
             if (f == NULL) {
                 snprintf(current_file_path, sizeof(current_file_path), BASE_LOG_PATH, current_file_index);
@@ -345,7 +337,8 @@ void log_writer_task(void *pvParameters) {
                                "%llu,0x%08lX,%d,%d,%d,%s\n",
                                log_frame.timestamp_us, log_frame.msg.identifier,
                                log_frame.msg.extd, log_frame.msg.rtr,
-                               log_frame.msg.data_length_code, hex_str);
+                               log_frame.msg.data_length_code, 
+                               hex_str);
 
             if (len > 0 && f != NULL) {
                 if (fwrite(csv_buffer, 1, len, f) != len) {
