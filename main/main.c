@@ -378,14 +378,15 @@ void log_writer_task(void *pvParameters) {
 
 // ========================== BUTTON & UART CONTROL ==========================
 void button_task(void *pvParameters) {
-    int last_state = 1;
-    
-    while (1) {
-        int current_state = gpio_get_level(USER_BUTTON_PIN);
+    uint32_t gpio_num;
+    static int64_t last_interrupt_time = 0;
+    int64_t debounce_delay_us = 200000; // 200ms in microseconds
 
-        if (last_state == 1 && current_state == 0) {// Button pressed
-            vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
-            if (gpio_get_level(USER_BUTTON_PIN) == 0) {
+    while (1) {
+        if (xQueueReceive(gpio_evt_queue, &gpio_num, portMAX_DELAY)) {
+            int64_t current_time = esp_timer_get_time();
+
+            if ((current_time - last_interrupt_time) > debounce_delay_us) {
                 
                 logging_active = !logging_active;
 
@@ -399,14 +400,9 @@ void button_task(void *pvParameters) {
                     frames_dropped = 0;
                     write_errors = 0;
                 }
-                
-                while (gpio_get_level(USER_BUTTON_PIN) == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(20));
-                }
+                last_interrupt_time = current_time;
             }
         }
-        last_state = current_state;
-        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -729,7 +725,7 @@ void app_main(void)
     init_sdmmc();
     init_ui_and_uart();
 
-    xTaskCreatePinnedToCore(button_task, "button_task", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(button_task, "button_task", 2048, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(can_rx_task, "can_rx_task", 3072, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(log_writer_task, "log_writer_task", 4096, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(monitor_status_task, "status_monitor_t", 2048, NULL, 2, NULL, 1);
