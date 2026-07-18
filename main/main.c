@@ -11,6 +11,7 @@
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 #include "esp_log.h"
@@ -202,7 +203,7 @@ void can_rx_task(void *pvParameters) {
             if (!logging_active) {
                 continue; 
             }
-            decode_j1939_id(rx_frame.identifier);
+            //decode_j1939_id(rx_frame.identifier);
 
             if (force_file_rotate) {
                 frames_received = 0;
@@ -222,32 +223,6 @@ void can_rx_task(void *pvParameters) {
 }
 
 // ========================== SD CARD LOG HANDLER ==========================
-FILE* verify_and_open_csv(bool *is_new_file) {
-    struct stat st;
-    
-    if (stat(BASE_LOG_PATH, &st) == 0) {
-        *is_new_file = false;
-    } else {
-        *is_new_file = true;
-    }
-
-    FILE *f = fopen(BASE_LOG_PATH, "a");
-    if (f == NULL) {
-        atomic_fetch_add(&write_errors, 1);
-        return NULL;
-    }
-
-    if (*is_new_file) {
-        const char *header = "timestamp_us,id,extended,rtr,dlc,data_hex\n";
-        if (fwrite(header, 1, strlen(header), f) != strlen(header)) {
-            atomic_fetch_add(&write_errors, 1);
-            fclose(f);
-            return NULL;
-        }
-        fflush(f); 
-    }
-    return f;
-}
 
 int scan_next_available_index(void) {
     int index = 1;
@@ -607,16 +582,15 @@ void init_sdmmc(void) {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 5,
-        .allocation_unit_size = 16 * 1024
+        .allocation_unit_size = 16 * 1024,
     };
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    //host.max_freq_khz = SDMMC_FREQ_DEFAULT;
-    host.max_freq_khz = 4000; // Un-comment to customize frequency
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    //host.max_freq_khz = 4000; // Un-comment to customize frequency
     
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.width = 4;
-    
     slot_config.clk = (gpio_num_t)SDMMC_CLK_PIN;
     slot_config.cmd = (gpio_num_t)SDMMC_CMD_PIN;
     slot_config.d0  = (gpio_num_t)SDMMC_D0_PIN;
