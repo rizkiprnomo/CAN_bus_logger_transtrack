@@ -39,6 +39,8 @@
 #define MOUNT_POINT     "/sdcard"
 #define BASE_LOG_PATH   "/sdcard/can_%03d.csv"
 
+#define CIRCULAR_BUFFER_SIZE    256     //(power of 2 recommended)
+
 // ========================== GLOBAL VARIABLES ==========================
 
 sdmmc_card_t *sd_card = NULL;
@@ -52,6 +54,7 @@ typedef struct {
     uint8_t data[8];
     bool extd;
     bool rtr;
+    uint32_t tstamp;
 } can_flat_frame_t;
 
 typedef struct {
@@ -65,7 +68,6 @@ QueueHandle_t can_rx_queue;
 
 // Task handles
 TaskHandle_t can_rx_task_handle = NULL;
-QueueHandle_t sd_log_queue = NULL;
 
 // Statistics (atomic for thread safety)
 atomic_uint_fast32_t frames_received = 0;
@@ -73,11 +75,11 @@ atomic_uint_fast32_t frames_dropped = 0;
 atomic_uint_fast32_t write_errors = 0;
 
 // System state
-volatile bool logging_active = false; 
-volatile int current_file_index = 1;
-volatile bool force_file_rotate = false;
-volatile bool sd_card_not_found = false; 
-volatile bool bus_off_detected = false;  
+atomic_bool logging_active = false; 
+atomic_int current_file_index = 1;
+atomic_bool force_file_rotate = false;
+atomic_bool sd_card_not_found = false; 
+atomic_bool bus_off_detected = false;  
 
 // LED status
 typedef enum {
@@ -91,13 +93,40 @@ typedef enum {
 
 volatile led_status_t current_led_status = LED_STATUS_LOGGING;
 
+static SemaphoreHandle_t log_file_mutex = NULL;
+
+//Log file struct
+typedef struct {
+    FILE* fp;
+    char current_path[64];
+    uint32_t frames_written;
+    int64_t last_flush_time;
+    bool is_open;
+} log_file_state_t;
+
+static log_file_state_t log_state = { .fp = NULL, .is_open = false };
+
+// Circular buffer struct
+typedef struct {
+    can_log_frame_t buffer[CIRCULAR_BUFFER_SIZE];
+    atomic_uint head;
+    atomic_uint tail;
+    atomic_uint count;   
+} circular_log_buffer_t;
+
+static circular_log_buffer_t log_buffer = {0};
+
 // ========================== FUNCTION PROTOTYPES ==========================
 void decode_j1939_id(uint32_t id);
 void init_twai(void);
 void init_sdmmc(void);
 void init_ui_and_uart(void);
 int scan_next_available_index(void);
-FILE* verify_and_open_csv(bool*);
+static bool open_log_file(void);
+static void close_current_log_file(void);
+static void flush_log_file(void);
+static bool write_can_frame_to_csv(const can_log_frame_t *frame);
+static bool circular_buffer_push(const can_log_frame_t *frame);
 
 // ========================== ISR & CALLBACKS ==========================
 static void IRAM_ATTR gpio_isr_handler(void* arg)
@@ -151,7 +180,8 @@ static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_
                 .identifier = rx_frame.header.id,
                 .data_length_code = rx_frame.header.dlc,
                 .extd = rx_frame.header.ide,
-                .rtr = rx_frame.header.rtr
+                .rtr = rx_frame.header.rtr,
+                .tstamp = rx_frame.header.timestamp,
             };
             memcpy(flat_frame.data, recv_buff, rx_frame.header.dlc);
             xQueueSendFromISR(can_rx_queue, &flat_frame, &xHigherPriorityTaskWoken);
@@ -184,191 +214,298 @@ void can_rx_task(void *pvParameters) {
     can_rx_task_handle = xTaskGetCurrentTaskHandle();
 
     while (1) {
-        // Handle Bus-Off recovery notification
-        if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, 0) == pdTRUE) {
-            if (notification_value & 0x01) {
-                ESP_LOGW("CAN_TASK", "Received Bus-Off signal... Executing twai_node_recover()...");
-                if (twai_node_recover(twai_node) == ESP_OK) {
-                    bus_off_detected = true; 
-                    ESP_LOGI("CAN_TASK", "twai_node_recover() successful.");
-                } else {
-                    bus_off_detected = false;
-                    ESP_LOGE("CAN_TASK", "Failed to execute twai_node_recover()!");
-                }
+        // Check bus-off notification (non-blocking)
+        xTaskNotifyWait(0, ULONG_MAX, &notification_value, 0);
+
+        if (notification_value & 0x01) {
+            ESP_LOGW("CAN_TASK", "Bus-Off detected, attempting recovery...");
+            if (twai_node_recover(twai_node) == ESP_OK) {
+                atomic_store(&bus_off_detected, false);
+                ESP_LOGI("CAN_TASK", "TWAI recovered successfully");
             }
+            notification_value = 0;
         }
 
         if (xQueueReceive(can_rx_queue, &rx_frame, portMAX_DELAY) == pdTRUE) {
-            // Process incoming CAN frames
-            if (!logging_active) {
-                continue; 
-            }
+            if (!atomic_load(&logging_active)) continue;
+
             //decode_j1939_id(rx_frame.identifier);
-
-            if (force_file_rotate) {
-                frames_received = 0;
-                frames_dropped = 0;
-            }
-
-            atomic_fetch_add(&frames_received, 1);
-    
             log_frame.timestamp_us = esp_timer_get_time();
             log_frame.msg = rx_frame;
-
-            if (xQueueSend(sd_log_queue, &log_frame, 0) != pdTRUE) {
+            
+            // Push to circular buffer
+            if (!circular_buffer_push(&log_frame)) {
                 atomic_fetch_add(&frames_dropped, 1);
+            } else {
+                atomic_fetch_add(&frames_received, 1);
             }
         }
     }
+}
+
+
+// Initialize circular buffer
+static void circular_buffer_init(void) {
+    atomic_store(&log_buffer.head, 0);
+    atomic_store(&log_buffer.tail, 0);
+    atomic_store(&log_buffer.count, 0);
+}
+
+// Push frame
+static bool circular_buffer_push(const can_log_frame_t *frame) {
+    uint32_t current_count = atomic_load(&log_buffer.count);
+    
+    if (current_count >= CIRCULAR_BUFFER_SIZE) {
+        atomic_fetch_add(&frames_dropped, 1);
+        return false;               
+    }
+
+    uint32_t head = atomic_load(&log_buffer.head);
+    log_buffer.buffer[head] = *frame;
+    
+    atomic_store(&log_buffer.head, (head + 1) % CIRCULAR_BUFFER_SIZE);
+    atomic_fetch_add(&log_buffer.count, 1);
+    
+    return true;
+}
+
+// Pop frame 
+static bool circular_buffer_pop(can_log_frame_t *frame) {
+    if (atomic_load(&log_buffer.count) == 0) {
+        return false;
+    }
+
+    uint32_t tail = atomic_load(&log_buffer.tail);
+    *frame = log_buffer.buffer[tail];
+    
+    atomic_store(&log_buffer.tail, (tail + 1) % CIRCULAR_BUFFER_SIZE);
+    atomic_fetch_sub(&log_buffer.count, 1);
+    
+    return true;
+}
+
+// Get current count
+static uint32_t circular_buffer_count(void) {
+    return atomic_load(&log_buffer.count);
 }
 
 // ========================== SD CARD LOG HANDLER ==========================
 
 int scan_next_available_index(void) {
-    int index = 1;
     char path_buffer[64];
     struct stat st;
+    
+    uint8_t header_size = 44; 
+    int index = atomic_load(&current_file_index);
+    const int MAX_SCAN = 500;        
 
-    while (1) {
+    for (int i = 0; i < MAX_SCAN; i++) {   
         snprintf(path_buffer, sizeof(path_buffer), BASE_LOG_PATH, index);
         
         if (stat(path_buffer, &st) != 0) {
+            atomic_store(&current_file_index, index);
             return index;
         }
         
-        if (st.st_size == 0) {
+        if (st.st_size <header_size) {
+            atomic_store(&current_file_index, index);
             return index;
         }
-
         index++;
     }
+
+    ESP_LOGE("SD_INDEX", "No available index found! Using %d", index);
+    return index;
 }
+
+// ========================== SD CARD LOG HANDLER ==========================
+
+//with circular buffer
 
 void log_writer_task(void *pvParameters) {
     can_log_frame_t log_frame;
-    char csv_buffer[128];
-    char current_file_path[64];
     int sync_counter = 0;
-    FILE *f = NULL;
-    bool sd_healthy = true;
 
-    vTaskDelay(pdMS_TO_TICKS(200)); 
-    current_file_index = scan_next_available_index();
-    ESP_LOGI("SD_INIT", "Initial index file ready for use: can_%03d.csv", current_file_index);
+    const int FLUSH_INTERVAL = 30;
+    const uint32_t MAX_FRAMES_PER_FILE = 8000;
+
+    log_file_mutex = xSemaphoreCreateMutex();
+    if (log_file_mutex == NULL) {
+        ESP_LOGE("SD_LOG", "Failed to create mutex!");
+        vTaskDelete(NULL);
+    }
+
+    circular_buffer_init();
+
+    vTaskDelay(pdMS_TO_TICKS(300));
+    atomic_store(&current_file_index, scan_next_available_index());
 
     while (1) {
-        if (xQueueReceive(sd_log_queue, &log_frame, pdMS_TO_TICKS(500)) == pdTRUE) {
-            
-            if (!logging_active) {
-                if (f != NULL) {
-                    fclose(f); 
-                    f = NULL;
-                }
-                continue; 
+        if (!atomic_load(&logging_active)) {
+            close_current_log_file();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (atomic_load(&force_file_rotate)) {
+            close_current_log_file();
+            atomic_store(&current_file_index, scan_next_available_index());
+            atomic_store(&force_file_rotate, false);
+        }
+
+        if (!log_state.is_open) {
+            if (!open_log_file()) {
+                vTaskDelay(pdMS_TO_TICKS(150));
+                continue;
             }
-            // Handle file rotation
-            if (force_file_rotate) {
-                if (f != NULL) {
-                    fclose(f);
-                    f = NULL;
-                }
-                sync_counter = 0;
-    
-                force_file_rotate = false; 
+        }
+
+        // batching cirular buffer
+        bool wrote_something = false;
+        while (circular_buffer_pop(&log_frame)) {
+            if (write_can_frame_to_csv(&log_frame)) {
+                log_state.frames_written++;
+                sync_counter++;
+                wrote_something = true;
             }
 
-            // Open file if not open
-            if (f == NULL) {
-                snprintf(current_file_path, sizeof(current_file_path), BASE_LOG_PATH, current_file_index);
-
-                struct stat st;
-                bool need_header = (stat(current_file_path, &st) != 0 || st.st_size == 0);
-
-                f = fopen(current_file_path, "a");
-                if (f == NULL) {
-                    sd_healthy = false;
-                    atomic_fetch_add(&write_errors, 1);
-                    vTaskDelay(pdMS_TO_TICKS(50));
-                    continue; 
-                }
-                sd_healthy = true;
-
-                if (need_header) {
-                    const char *header = "timestamp_us,id,extended,rtr,dlc,data_hex\n";
-                    if (fwrite(header, 1, strlen(header), f) == strlen(header)) {
-                        fflush(f);
-                    } else {
-                        atomic_fetch_add(&write_errors, 1);
-                    }
-                }
-            }
-            // Convert data to hex string
-            char hex_str[17] = {0}; 
-            for (int i = 0; i < log_frame.msg.data_length_code; i++) {
-                sprintf(&hex_str[i * 2], "%02X", log_frame.msg.data[i]);
-            }
-            // Write CSV line
-            int len = snprintf(csv_buffer, sizeof(csv_buffer),
-                               "%llu,0x%08lX,%d,%d,%d,%s\n",
-                               log_frame.timestamp_us, log_frame.msg.identifier,
-                               log_frame.msg.extd, log_frame.msg.rtr,
-                               log_frame.msg.data_length_code, 
-                               hex_str);
-
-            if (len > 0 && f != NULL) {
-                if (fwrite(csv_buffer, 1, len, f) != len) {
-                    atomic_fetch_add(&write_errors, 1);
-                    fclose(f);
-                    f = NULL;
-                    sd_healthy = false; 
-                } else {
-                    sync_counter++;
-                }
-            }
-            // Periodic sync
-            if (sync_counter >= 50) {
-                if (f != NULL) {
-                    fclose(f);
-                    f = NULL;
-                }
+            if (sync_counter >= FLUSH_INTERVAL) {
+                flush_log_file();
                 sync_counter = 0;
             }
-        } else {
-            // Timeout: close file for safety
-            if (f != NULL) {
-                fclose(f);
-                f = NULL;
-                sync_counter = 0;
+
+            if (log_state.frames_written >= MAX_FRAMES_PER_FILE) {
+                atomic_store(&force_file_rotate, true);
+                break;
             }
+        }
+
+        if (!wrote_something) {            
+            if (log_state.is_open && (esp_timer_get_time() - log_state.last_flush_time > 1000000)) {
+                flush_log_file();
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }
 
+static bool open_log_file(void) {
+    
+    struct stat st;
+    bool file_exists = (stat(log_state.current_path, &st) == 0);
+    bool is_empty = (!file_exists || st.st_size == 0);
+    
+    if (xSemaphoreTake(log_file_mutex, pdMS_TO_TICKS(250)) != pdTRUE) 
+        return false;
+
+    snprintf(log_state.current_path, sizeof(log_state.current_path), 
+             BASE_LOG_PATH, atomic_load(&current_file_index));
+
+    
+    log_state.fp = fopen(log_state.current_path, "a");
+    if (log_state.fp == NULL) {
+        atomic_fetch_add(&write_errors, 1);
+        xSemaphoreGive(log_file_mutex);
+        return false;
+    }
+
+    log_state.is_open = true;
+    log_state.frames_written = 0;
+
+    if (is_empty) {
+        const char *header = "timestamp_us,id,extended,rtr,dlc,data_hex\n";
+        fwrite(header, 1, strlen(header), log_state.fp);
+        fflush(log_state.fp);
+        ESP_LOGI("SD_LOG", "Created new file with header: %s", log_state.current_path);
+    }
+
+    xSemaphoreGive(log_file_mutex);
+    return true;
+}
+
+static bool write_can_frame_to_csv(const can_log_frame_t *frame) {
+    char hex_str[17] = {0};
+    char csv_buffer[128];
+    
+    if (!log_state.fp) return false;
+
+    if (xSemaphoreTake(log_file_mutex, pdMS_TO_TICKS(60)) != pdTRUE) {
+        atomic_fetch_add(&write_errors, 1);
+        return false;
+    }
+
+    for (int i = 0; i < frame->msg.data_length_code; i++) {
+        sprintf(&hex_str[i*2], "%02X", frame->msg.data[i]);
+    }
+
+    int len = snprintf(csv_buffer, sizeof(csv_buffer),
+                       "%llu,0x%08lX,%d,%d,%d,%s\n",
+                       frame->timestamp_us, frame->msg.identifier,
+                       frame->msg.extd, frame->msg.rtr,
+                       frame->msg.data_length_code, hex_str);
+
+    bool success = false;
+    if (len > 0) {
+        if (fwrite(csv_buffer, 1, len, log_state.fp) == (size_t)len) {
+            success = true;
+        } else {
+            atomic_fetch_add(&write_errors, 1);
+        }
+    }
+
+    xSemaphoreGive(log_file_mutex);
+    return success;
+}
+
+static void flush_log_file(void) {
+    if (!log_state.is_open || !log_state.fp) return;
+    if (xSemaphoreTake(log_file_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+
+    fflush(log_state.fp);
+    xSemaphoreGive(log_file_mutex);
+}
+
+static void close_current_log_file(void) {
+    if (xSemaphoreTake(log_file_mutex, pdMS_TO_TICKS(300)) != pdTRUE) return;
+
+    if (log_state.fp) {
+        fflush(log_state.fp);
+        fclose(log_state.fp);
+        log_state.fp = NULL;
+    }
+    log_state.is_open = false;
+    xSemaphoreGive(log_file_mutex);
+}
+
 // ========================== BUTTON & UART CONTROL ==========================
+
 void button_task(void *pvParameters) {
     uint32_t gpio_num;
     static int64_t last_interrupt_time = 0;
-    int64_t debounce_delay_us = 200000; // 200ms in microseconds
 
     while (1) {
         if (xQueueReceive(gpio_evt_queue, &gpio_num, portMAX_DELAY)) {
-            int64_t current_time = esp_timer_get_time();
+            int64_t now = esp_timer_get_time();
 
-            if ((current_time - last_interrupt_time) > debounce_delay_us) {
-                
-                logging_active = !logging_active;
+            if (now - last_interrupt_time > 200000) {  // 200ms debounce
+                bool new_state = !atomic_load(&logging_active);
+                atomic_store(&logging_active, new_state);
 
-                if (logging_active) {
-                    current_file_index = scan_next_available_index();
-                    force_file_rotate = true; 
-                    ESP_LOGI("BUTTON", "Logging STARTED -> Target File: can_%03d.csv", current_file_index);
+                if (new_state) {
+                    current_file_index=scan_next_available_index();
+                    ESP_LOGI("BUTTON", "Logging STARTED -> can_%03d.csv", 
+                             atomic_load(&current_file_index));
+                    atomic_store(&force_file_rotate, true);
                 } else {
                     ESP_LOGW("BUTTON", "Logging STOPPED");
+                    atomic_store(&force_file_rotate, false);
+                    logging_active = false;
+                    force_file_rotate = false;
                     frames_received = 0;
                     frames_dropped = 0;
                     write_errors = 0;
                 }
-                last_interrupt_time = current_time;
+                last_interrupt_time = now;
             }
         }
     }
@@ -393,7 +530,6 @@ void uart_task(void *pvParameters) {
                     cmd_buffer[pos] = '\0';
                     
                     if (strcmp(cmd_buffer, "start") == 0) {
-                        ESP_LOGI("BUTTON", "Logging STARTED -> Target File: can_%03d.csv", current_file_index);
                         logging_active = true;
                     } else if (strcmp(cmd_buffer, "stop") == 0) {
                         logging_active = false;
@@ -420,73 +556,106 @@ void uart_task(void *pvParameters) {
 }
 
 // ========================== STATUS MONITOR & LED ==========================
+
 void monitor_status_task(void *pvParameters) {
     gpio_reset_pin(STATUS_LED_PIN);
     gpio_set_direction(STATUS_LED_PIN, GPIO_MODE_OUTPUT);
-    
-    while (1) {
-        if (logging_active) {
-            printf("\n--- [CAN LOGGER STATUS] ---\n");
-            printf("Frames Received : %d\n", frames_received);
-            printf("Frames Dropped  : %d\n", frames_dropped);
-            printf("Write Errors    : %d\n", write_errors);
-            printf("---------------------------\n");
-        }
 
-        // Update LED status
-        if (sd_card_not_found) {
-            current_led_status = LED_STATUS_SD_FAIL;
-        } else if (bus_off_detected) {
-            current_led_status = LED_STATUS_BUS_OFF;
-        } else if (write_errors > 0) {
-            current_led_status = LED_STATUS_ERROR;
-        } else if (logging_active) {
-            current_led_status = LED_STATUS_LOGGING;
-        } else {
-            current_led_status = LED_STATUS_IDLE;
+    int64_t last_print_time = 0;
+    int64_t last_led_time = 0;
+    uint8_t led_state = 0;
+    uint8_t write_error_threshold = 5;
+    uint32_t blink_interval = 500;  // default
+
+    while (1) {
+        int64_t now = esp_timer_get_time();
+
+        // === Update System Status ===
+        if (now - last_print_time > 1000000) {  // 1 detik
+            if (atomic_load(&logging_active)) {
+                printf("\n--- [CAN LOGGER STATUS] ---\n");
+                printf("Frames Received : %d\n", atomic_load(&frames_received));
+                printf("Frames Dropped  : %d\n", atomic_load(&frames_dropped));
+                printf("Write Errors    : %d\n", atomic_load(&write_errors));
+                printf("Buffered        : %lu / %d\n", circular_buffer_count(), CIRCULAR_BUFFER_SIZE);
+                printf("Current File    : can_%03d.csv\n", atomic_load(&current_file_index));
+                printf("---------------------------\n");
+            }
+
+            last_print_time = now;
         }
         
-        // LED patterns (non-blocking style)
-        switch (current_led_status) {
-            case LED_STATUS_STARTUP:
-                gpio_set_level(STATUS_LED_PIN, 1);
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                break;
-
-            case LED_STATUS_SD_FAIL: 
-                for(int i=0; i<3; i++) { 
-                    gpio_set_level(STATUS_LED_PIN, 1); vTaskDelay(100); gpio_set_level(STATUS_LED_PIN, 0); vTaskDelay(100);
-                }
-                vTaskDelay(pdMS_TO_TICKS(500));
-                break;
-
-            case LED_STATUS_BUS_OFF: 
-                gpio_set_level(STATUS_LED_PIN, 0); 
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                break;
-
-            case LED_STATUS_IDLE: 
-                
-                gpio_set_level(STATUS_LED_PIN, 1); vTaskDelay(200); gpio_set_level(STATUS_LED_PIN, 0); vTaskDelay(800);
-                break;
-
-            case LED_STATUS_LOGGING: 
-                
-                gpio_set_level(STATUS_LED_PIN, 1); vTaskDelay(50); gpio_set_level(STATUS_LED_PIN, 0); vTaskDelay(100);
-                break;
-
-            case LED_STATUS_ERROR: 
-                gpio_set_level(STATUS_LED_PIN, 1);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                gpio_set_level(STATUS_LED_PIN, 0);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                gpio_set_level(STATUS_LED_PIN, 1);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                gpio_set_level(STATUS_LED_PIN, 0);
-                vTaskDelay(pdMS_TO_TICKS(600)); 
-                break;
+        // === Determine Current Status ===
+        led_status_t status;
+        if (sd_card_not_found) {
+            status = LED_STATUS_SD_FAIL;
+        } else if (atomic_load(&bus_off_detected)) {
+            status = LED_STATUS_BUS_OFF;
+        } else if (atomic_load(&write_errors) > write_error_threshold) {
+            status = LED_STATUS_ERROR;
+        } else if (atomic_load(&logging_active)) {
+            status = LED_STATUS_LOGGING;
+        } else {
+            status = LED_STATUS_IDLE;
         }
-        vTaskDelay(pdMS_TO_TICKS(200)); 
+        
+
+        // === Non-blocking LED Pattern ===
+        
+        switch (status) {
+            case LED_STATUS_SD_FAIL:      // Fast triple blink
+                blink_interval = 80000;
+                if (now - last_led_time > blink_interval) {
+                    led_state = !led_state;
+                    gpio_set_level(STATUS_LED_PIN, led_state);
+                    last_led_time = now;
+                }
+                break;
+
+            case LED_STATUS_BUS_OFF:      // Solid OFF
+                gpio_set_level(STATUS_LED_PIN, 0);
+                break;
+
+            case LED_STATUS_IDLE:         // Slow blink (1s on, 4s off)
+                blink_interval = 500000;
+                if (now - last_led_time > (led_state ? 100000 : 400000)) {
+                    led_state = !led_state;
+                    gpio_set_level(STATUS_LED_PIN, led_state);
+                    last_led_time = now;
+                }
+                break;
+
+            case LED_STATUS_LOGGING:      // Fast heartbeat (50ms on, 150ms off)
+                blink_interval = 200000;
+                if (now - last_led_time > (led_state ? 50000 : 150000)) {
+                    led_state = !led_state;
+                    gpio_set_level(STATUS_LED_PIN, led_state);
+                    last_led_time = now;
+                }
+                break;
+
+            case LED_STATUS_ERROR:        // Double blink
+                blink_interval = 250000;
+                if (now - last_led_time > blink_interval) {
+                    led_state++;
+                    if (led_state > 3) led_state = 0;
+                    
+                    if (led_state == 1 || led_state == 3) {
+                        gpio_set_level(STATUS_LED_PIN, 1);
+                    } else {
+                        gpio_set_level(STATUS_LED_PIN, 0);
+                    }
+                    last_led_time = now;
+                }
+                break;
+
+            default:
+                gpio_set_level(STATUS_LED_PIN, 0);
+                break;
+            
+        }
+                
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -494,10 +663,9 @@ void monitor_status_task(void *pvParameters) {
 void init_twai(void) {
     ESP_LOGI(TAG, "Initializing On-Chip TWAI Node with Advanced Timing...");
 
-    can_rx_queue = xQueueCreate(30, sizeof(can_flat_frame_t));
-    sd_log_queue = xQueueCreate(100, sizeof(can_log_frame_t));
+    can_rx_queue = xQueueCreate(100, sizeof(can_flat_frame_t));
 
-    if (can_rx_queue == NULL || sd_log_queue == NULL) {
+    if (can_rx_queue == NULL) {
         ESP_LOGE("MAIN", "Failed to allocate Queue!");
         return;
     }
@@ -508,6 +676,7 @@ void init_twai(void) {
         .bit_timing.bitrate = CONFIG_TWAI_BITRATE_VALUE, 
         .timestamp_resolution_hz = 1000000,
         .flags.enable_listen_only = true, 
+        .flags.enable_self_test = false,
     };
 
     esp_err_t ret = twai_new_node_onchip(&node_config, &twai_node);
@@ -544,17 +713,18 @@ void init_twai(void) {
     }
 
     twai_mask_filter_config_t dual_config = twai_make_dual_filter(
-    0x0CF0, 
-    0xFFFF, 
-    0x0F00, 
-    0xFFFF, 
-    true    
+        0x0CF0, 0xFFFF,   // Filter 1
+        0x0F00, 0xFFFF,   // Filter 2
+        true              // Extended frame
     );
 
-    ESP_ERROR_CHECK(twai_node_config_mask_filter(twai_node, 0, &dual_config));
-    ESP_LOGI(TAG, "Filter enabled");
+    ret = twai_node_config_mask_filter(twai_node, 0, &dual_config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "TWAI acceptance filter configured successfully");
+    } else {
+        ESP_LOGW(TAG, "Failed to set filter: %s (continuing without filter)", esp_err_to_name(ret));
+    }
     
-
     twai_event_callbacks_t user_cbs = {
         .on_rx_done = twai_rx_cb,
         .on_error = twai_listener_on_error_callback,
@@ -569,9 +739,11 @@ void init_twai(void) {
     
     ret = twai_node_enable(twai_node);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "TWAI Node with Advanced Timing Successfully Operated.");
+        ESP_LOGI(TAG, "TWAI Controller started successfully | Bitrate: %d bps | Listen-Only: %s",
+                 CONFIG_TWAI_BITRATE_VALUE,
+                 node_config.flags.enable_listen_only ? "ENABLED" : "DISABLED");
     } else {
-        ESP_LOGE(TAG, "Failed to activate TWAI node: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to enable TWAI node: %s", esp_err_to_name(ret));
     }
 }
 
@@ -692,7 +864,7 @@ void app_main(void)
     init_sdmmc();
     init_ui_and_uart();
 
-    xTaskCreatePinnedToCore(button_task, "button_task", 2048, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(button_task, "button_task", 3072, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(can_rx_task, "can_rx_task", 3072, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(log_writer_task, "log_writer_task", 4096, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(monitor_status_task, "status_monitor_t", 2048, NULL, 2, NULL, 1);
